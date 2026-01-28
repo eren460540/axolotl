@@ -2432,56 +2432,75 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
     await sync_free_generator_role(after)
 
 
-async def restock_generator(ctx: commands.Context, tier: str, accounts: str):
-    tokens = accounts.split() if accounts else []
-    added = 0
-    skipped = 0
+async def restock_generator(ctx: commands.Context, tier: str):
+    attachments = list(ctx.message.attachments)
+    if not attachments:
+        await ctx.send("❌ Please attach a .txt file with accounts to restock.")
+        return
+    if len(attachments) != 1:
+        await ctx.send("❌ Please attach exactly one .txt file for restocking.")
+        return
+    attachment = attachments[0]
+    _, extension = os.path.splitext(attachment.filename)
+    if extension.lower() != ".txt":
+        await ctx.send("❌ Only .txt attachments are supported for restocking.")
+        return
+    try:
+        payload = await attachment.read()
+        content = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        await ctx.send("❌ Unable to decode the attachment as UTF-8 text.")
+        return
+
     inserts = []
-    for entry in tokens:
-        if ":" not in entry:
-            skipped += 1
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or ":" not in stripped:
             continue
-        username, password = entry.split(":", 1)
+        username, password = stripped.split(":", 1)
+        username = username.strip()
+        password = password.strip()
         if not username or not password:
-            skipped += 1
             continue
         inserts.append((tier, username, password, ctx.author.id, now_ts()))
-        added += 1
-    if inserts:
-        await db_pool.executemany(
-            """
-            INSERT INTO generator_stock (tier, username, password, added_by, added_at)
-            VALUES ($1, $2, $3, $4, $5)
-            """,
-            inserts,
-        )
+
+    if not inserts:
+        await ctx.send("❌ No valid accounts were found in the attachment.")
+        return
+
+    await db_pool.executemany(
+        """
+        INSERT INTO generator_stock (tier, username, password, added_by, added_at)
+        VALUES ($1, $2, $3, $4, $5)
+        """,
+        inserts,
+    )
     embed = discord.Embed(
         title="✅ Generator Restock Summary",
         color=GENERATOR_TIER_COLORS.get(tier, discord.Color.blurple()),
     )
     embed.add_field(name="Service", value=tier, inline=True)
-    embed.add_field(name="Added", value=str(added), inline=True)
-    embed.add_field(name="Skipped", value=str(skipped), inline=True)
+    embed.add_field(name="Added", value=str(len(inserts)), inline=True)
     await ctx.send(embed=embed)
     await log_event("admin_command", ctx.author.id, f"!restock_{tier}")
 
 
 @bot.command()
 @commands.has_guild_permissions(manage_guild=True)
-async def restock_free(ctx: commands.Context, *, accounts: str):
-    await restock_generator(ctx, "free", accounts)
+async def restock_free(ctx: commands.Context):
+    await restock_generator(ctx, "free")
 
 
 @bot.command()
 @commands.has_guild_permissions(manage_guild=True)
-async def restock_premium(ctx: commands.Context, *, accounts: str):
-    await restock_generator(ctx, "premium", accounts)
+async def restock_premium(ctx: commands.Context):
+    await restock_generator(ctx, "premium")
 
 
 @bot.command()
 @commands.has_guild_permissions(manage_guild=True)
-async def restock_op(ctx: commands.Context, *, accounts: str):
-    await restock_generator(ctx, "op", accounts)
+async def restock_op(ctx: commands.Context):
+    await restock_generator(ctx, "op")
 
 
 async def handle_gen(ctx: commands.Context, tier: str, required_role_id: int):
