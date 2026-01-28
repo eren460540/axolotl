@@ -2507,51 +2507,43 @@ async def handle_gen(ctx: commands.Context, tier: str, required_role_id: int):
         async with conn.transaction():
             row = await conn.fetchrow(
                 """
-                WITH picked AS (
-                    SELECT id, username, password
-                    FROM generator_stock
-                    WHERE tier=$1 AND claimed=FALSE
-                    ORDER BY id ASC
-                    FOR UPDATE SKIP LOCKED
-                    LIMIT 1
-                )
-                UPDATE generator_stock
-                SET claimed=TRUE, claimed_by=$2, claimed_at=$3
-                FROM picked
-                WHERE generator_stock.id = picked.id
-                RETURNING picked.username, picked.password
+                SELECT id, username, password
+                FROM generator_stock
+                WHERE tier=$1 AND claimed=FALSE
+                ORDER BY random()
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
                 """,
                 tier,
-                ctx.author.id,
-                now,
             )
             actual_tier = tier
             if not row and tier == "premium":
                 row = await conn.fetchrow(
                     """
-                    WITH picked AS (
-                        SELECT id, username, password
-                        FROM generator_stock
-                        WHERE tier=$1 AND claimed=FALSE
-                        ORDER BY id ASC
-                        FOR UPDATE SKIP LOCKED
-                        LIMIT 1
-                    )
-                    UPDATE generator_stock
-                    SET claimed=TRUE, claimed_by=$2, claimed_at=$3
-                    FROM picked
-                    WHERE generator_stock.id = picked.id
-                    RETURNING picked.username, picked.password
+                    SELECT id, username, password
+                    FROM generator_stock
+                    WHERE tier=$1 AND claimed=FALSE
+                    ORDER BY random()
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
                     """,
                     "free",
-                    ctx.author.id,
-                    now,
                 )
                 if row:
                     actual_tier = "free"
             if not row:
                 await ctx.send("⚠️ No accounts are available right now. Please try again later.")
                 return
+            await conn.execute(
+                """
+                UPDATE generator_stock
+                SET claimed=TRUE, claimed_by=$2, claimed_at=$3
+                WHERE id=$1
+                """,
+                row["id"],
+                ctx.author.id,
+                now,
+            )
             await conn.execute(
                 """
                 INSERT INTO generator_cooldowns (user_id, last_gen)
