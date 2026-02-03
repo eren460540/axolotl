@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import asyncpg
 import discord
 from discord.ext import commands
@@ -124,6 +125,25 @@ RNG_COOLDOWN = 0
 GENERATOR_COOLDOWN_SECONDS = 15
 
 timezone_berlin = ZoneInfo("Europe/Berlin")
+
+ROBLOX_USERNAME_RESOLVE_URL = "https://users.roblox.com/v1/usernames/users"
+ROBLOX_USER_URL = "https://users.roblox.com/v1/users/{user_id}"
+ROBLOX_AGE_BRACKET_URL = "https://users.roblox.com/v1/users/{user_id}/age-bracket"
+ROBLOX_FRIENDS_COUNT_URL = "https://friends.roblox.com/v1/users/{user_id}/friends/count"
+ROBLOX_FOLLOWERS_COUNT_URL = "https://friends.roblox.com/v1/users/{user_id}/followers/count"
+ROBLOX_FOLLOWING_COUNT_URL = "https://friends.roblox.com/v1/users/{user_id}/followings/count"
+ROBLOX_GROUPS_URL = "https://groups.roblox.com/v1/users/{user_id}/groups/roles"
+ROBLOX_AVATAR_THUMB_URL = (
+    "https://thumbnails.roblox.com/v1/users/avatar-headshot"
+    "?userIds={user_id}&size=150x150&format=Png&isCircular=false"
+)
+ROBLOX_CURRENTLY_WEARING_URL = "https://avatar.roblox.com/v1/users/{user_id}/currently-wearing"
+ROBLOX_ASSET_DETAILS_URL = "https://economy.roblox.com/v2/assets"
+ROBLOX_BADGES_URL = "https://badges.roblox.com/v1/users/{user_id}/badges"
+ROBLOX_FAVORITES_URL = "https://www.roblox.com/users/favorites/list-json"
+ROBLOX_INVENTORY_VISIBILITY_URL = "https://inventory.roblox.com/v1/users/{user_id}/can-view-inventory"
+
+RISK_FOOTER = "Risk score is heuristic-based and not definitive proof of an alternate account."
 
 
 def safe_button_emoji(custom_emoji: str | None, fallback_unicode: str):
@@ -310,6 +330,83 @@ async def send_command_banner(channel: discord.abc.Messageable, kind: str) -> No
     embed = discord.Embed(color=COLOR_MAP.get(kind, discord.Color.blurple()))
     embed.set_image(url=BANNER_MAP[kind])
     await channel.send(embed=embed)
+
+
+async def fetch_json(
+    session: aiohttp.ClientSession,
+    method: str,
+    url: str,
+    **kwargs,
+) -> tuple[Optional[dict], Optional[int]]:
+    try:
+        async with session.request(method, url, **kwargs) as response:
+            if response.status >= 400:
+                return None, response.status
+            data = await response.json()
+            return data, response.status
+    except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError):
+        return None, None
+
+
+async def resolve_roblox_username(session: aiohttp.ClientSession, username: str) -> Optional[dict]:
+    payload = {"usernames": [username], "excludeBannedUsers": False}
+    data, _ = await fetch_json(session, "POST", ROBLOX_USERNAME_RESOLVE_URL, json=payload)
+    if not data:
+        return None
+    matches = data.get("data", [])
+    if not matches:
+        return None
+    return matches[0]
+
+
+def is_random_username(username: str) -> bool:
+    letters = sum(char.isalpha() for char in username)
+    digits = sum(char.isdigit() for char in username)
+    if digits >= 4 and letters >= 2:
+        return True
+    if len(username) >= 10 and digits >= 3:
+        return True
+    if re.search(r"(.)\1{3,}", username):
+        return True
+    return False
+
+
+def format_account_age(created_at: datetime) -> tuple[str, int, float]:
+    now = datetime.now(timezone.utc)
+    age_days = max(0, (now - created_at).days)
+    age_years = age_days / 365.25 if age_days else 0
+    age_text = f"{age_days} days ({age_years:.2f} years)"
+    return age_text, age_days, age_years
+
+
+def classify_avatar_assets(asset_details: list[dict], total_assets: int) -> str:
+    if total_assets == 0:
+        return "Default / fully free"
+    paid_count = 0
+    unknown_count = 0
+    for asset in asset_details:
+        price = asset.get("price")
+        if price is None:
+            unknown_count += 1
+            continue
+        if isinstance(price, dict):
+            amount = price.get("amount")
+            if amount is None:
+                unknown_count += 1
+            elif amount > 0:
+                paid_count += 1
+        elif isinstance(price, (int, float)):
+            if price > 0:
+                paid_count += 1
+        else:
+            unknown_count += 1
+    if paid_count == 0 and unknown_count == 0:
+        return "Default / fully free"
+    if paid_count == total_assets and unknown_count == 0:
+        return "Custom / paid"
+    if paid_count == 0 and unknown_count == total_assets:
+        return "Mixed (unknown pricing)"
+    return "Mixed (free + non-default)"
 
 
 def chunk_lines(lines: list[str], max_chars: int = 3500) -> list[str]:
@@ -2624,6 +2721,256 @@ async def gen_premium(ctx: commands.Context):
 @bot.command()
 async def gen_op(ctx: commands.Context):
     await handle_gen(ctx, "op", OP_ROLE_ID)
+
+
+@bot.command()
+async def roblox(ctx: commands.Context, *, username: str):
+    await ctx.trigger_typing()
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        resolved = await resolve_roblox_username(session, username)
+        if not resolved:
+            await ctx.send("❌ User not found.")
+            return
+        user_id = resolved.get("id")
+        if not user_id:
+            await ctx.send("❌ User not found.")
+            return
+
+        user_data, _ = await fetch_json(session, "GET", ROBLOX_USER_URL.format(user_id=user_id))
+        age_data, _ = await fetch_json(session, "GET", ROBLOX_AGE_BRACKET_URL.format(user_id=user_id))
+        friends_data, _ = await fetch_json(session, "GET", ROBLOX_FRIENDS_COUNT_URL.format(user_id=user_id))
+        followers_data, _ = await fetch_json(session, "GET", ROBLOX_FOLLOWERS_COUNT_URL.format(user_id=user_id))
+        following_data, _ = await fetch_json(session, "GET", ROBLOX_FOLLOWING_COUNT_URL.format(user_id=user_id))
+        groups_data, _ = await fetch_json(session, "GET", ROBLOX_GROUPS_URL.format(user_id=user_id))
+        thumb_data, _ = await fetch_json(session, "GET", ROBLOX_AVATAR_THUMB_URL.format(user_id=user_id))
+        wearing_data, _ = await fetch_json(session, "GET", ROBLOX_CURRENTLY_WEARING_URL.format(user_id=user_id))
+        badges_data, _ = await fetch_json(
+            session,
+            "GET",
+            ROBLOX_BADGES_URL.format(user_id=user_id),
+            params={"limit": 10, "sortOrder": "Asc"},
+        )
+        favorites_data, _ = await fetch_json(
+            session,
+            "GET",
+            ROBLOX_FAVORITES_URL,
+            params={
+                "userId": user_id,
+                "assetTypeId": 9,
+                "itemsPerPage": 10,
+                "pageNumber": 1,
+            },
+        )
+        inventory_data, _ = await fetch_json(
+            session,
+            "GET",
+            ROBLOX_INVENTORY_VISIBILITY_URL.format(user_id=user_id),
+        )
+
+        asset_details: list[dict] = []
+        asset_ids = []
+        if wearing_data:
+            asset_ids = wearing_data.get("assetIds", [])
+        if asset_ids:
+            capped_ids = asset_ids[:50]
+            details_data, _ = await fetch_json(
+                session,
+                "GET",
+                ROBLOX_ASSET_DETAILS_URL,
+                params={"assetIds": ",".join(str(asset_id) for asset_id in capped_ids)},
+            )
+            if details_data:
+                asset_details = details_data.get("data", [])
+
+    if not user_data:
+        await ctx.send("⚠️ Unable to fetch public Roblox profile data right now.")
+        return
+
+    resolved_username = user_data.get("name", resolved.get("name", username))
+    display_name = user_data.get("displayName") or resolved_username
+    created_raw = user_data.get("created")
+    created_dt = None
+    if created_raw:
+        created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+    created_text = created_dt.strftime("%Y-%m-%d") if created_dt else "Unavailable"
+    age_text, age_days, _ = format_account_age(created_dt) if created_dt else ("Unavailable", 0, 0)
+    profile_url = f"https://www.roblox.com/users/{user_id}/profile"
+
+    age_bracket = None
+    if age_data:
+        age_bracket = age_data.get("ageBracket")
+    if age_bracket == "Over13":
+        above_13_text = "True"
+    elif age_bracket == "Under13":
+        above_13_text = "False"
+    else:
+        above_13_text = "Unavailable"
+
+    avatar_url = None
+    if thumb_data:
+        thumb_items = thumb_data.get("data", [])
+        if thumb_items:
+            avatar_url = thumb_items[0].get("imageUrl")
+
+    friends_count = friends_data.get("count") if friends_data else None
+    followers_count = followers_data.get("count") if followers_data else None
+    following_count = following_data.get("count") if following_data else None
+
+    group_names: list[str] = []
+    primary_group = None
+    groups_count = None
+    if groups_data:
+        groups_list = groups_data.get("data", [])
+        groups_count = len(groups_list)
+        for entry in groups_list:
+            group = entry.get("group") or {}
+            name = group.get("name")
+            if name:
+                group_names.append(name)
+            if entry.get("isPrimaryGroup") or entry.get("isPrimary"):
+                primary_group = name
+
+    avatar_classification = classify_avatar_assets(asset_details, len(asset_ids))
+
+    badges_available = badges_data is not None
+    badges_list = badges_data.get("data", []) if badges_data else []
+    has_badges = bool(badges_list)
+
+    favorites_available = favorites_data is not None
+    favorites_list = []
+    total_favorites = None
+    if favorites_data:
+        if "Data" in favorites_data:
+            favorites_list = favorites_data.get("Data", [])
+            total_favorites = favorites_data.get("TotalItems")
+        elif "data" in favorites_data:
+            favorites_list = favorites_data.get("data", [])
+        if total_favorites is None:
+            total_favorites = len(favorites_list)
+    has_favorites = bool(total_favorites)
+
+    inventory_visibility = None
+    if inventory_data:
+        inventory_visibility = inventory_data.get("canView")
+
+    risk_score = 0
+    breakdown: list[str] = []
+
+    if created_dt:
+        if age_days < 7:
+            risk_score += 20
+            breakdown.append("Account < 7 days (+20%)")
+        elif age_days < 30:
+            risk_score += 10
+            breakdown.append("Account < 30 days (+10%)")
+
+    if avatar_classification == "Default / fully free":
+        risk_score += 20
+        breakdown.append("Default / fully free avatar (+20%)")
+
+    if friends_count is not None:
+        if friends_count == 0:
+            risk_score += 15
+            breakdown.append("Friends = 0 (+15%)")
+        elif friends_count < 10:
+            risk_score += 10
+            breakdown.append("Friends < 10 (+10%)")
+
+    if followers_count is not None and followers_count == 0:
+        risk_score += 10
+        breakdown.append("Followers = 0 (+10%)")
+
+    if groups_count is not None and groups_count == 0:
+        risk_score += 10
+        breakdown.append("Groups = 0 (+10%)")
+
+    if groups_data is not None and not primary_group:
+        risk_score += 5
+        breakdown.append("No primary group (+5%)")
+
+    if badges_available and not has_badges:
+        risk_score += 5
+        breakdown.append("No badges (+5%)")
+
+    if favorites_available and not has_favorites:
+        risk_score += 5
+        breakdown.append("No favorite games (+5%)")
+
+    if inventory_visibility is False:
+        risk_score += 5
+        breakdown.append("Inventory hidden (+5%)")
+
+    if is_random_username(resolved_username):
+        risk_score += 5
+        breakdown.append("Random-looking username (+5%)")
+
+    if display_name != resolved_username:
+        risk_score += 5
+        breakdown.append("Display name differs (+5%)")
+
+    risk_score = min(100, risk_score)
+    if risk_score <= 20:
+        risk_tier = "Low Risk"
+    elif risk_score <= 45:
+        risk_tier = "Medium Risk"
+    elif risk_score <= 70:
+        risk_tier = "High Risk"
+    else:
+        risk_tier = "Very High Risk (likely alt)"
+
+    friends_text = str(friends_count) if friends_count is not None else "Unavailable"
+    followers_text = str(followers_count) if followers_count is not None else "Unavailable"
+    following_text = str(following_count) if following_count is not None else "Unavailable"
+    groups_text = str(groups_count) if groups_count is not None else "Unavailable"
+    primary_group_text = primary_group or ("None" if groups_data is not None else "Unavailable")
+
+    groups_display = "Unavailable"
+    if groups_count is not None:
+        if not group_names:
+            groups_display = f"{groups_count}"
+        else:
+            displayed = group_names[:10]
+            extra = groups_count - len(displayed)
+            names_text = ", ".join(displayed)
+            if extra > 0:
+                names_text = f"{names_text} (+{extra} more)"
+            groups_display = f"{groups_count} • {names_text}"
+
+    breakdown_text = "\n".join(f"• {item}" for item in breakdown) if breakdown else "• No risk signals detected."
+
+    embed = discord.Embed(
+        title="🧩 Roblox Account Check",
+        description="Full Account Info",
+        color=discord.Color.blurple(),
+    )
+    account_lines = [
+        f"**Username:** {resolved_username}",
+        f"**Display Name:** {display_name}",
+        f"**User ID:** {user_id}",
+        f"**Created:** {created_text}",
+        f"**Account Age:** {age_text}",
+        f"**Above 13:** {above_13_text}",
+        f"**Profile:** {profile_url}",
+    ]
+    embed.add_field(name="Account Info", value="\n".join(account_lines), inline=False)
+    social_lines = [
+        f"**Friends:** {friends_text}",
+        f"**Followers:** {followers_text}",
+        f"**Following:** {following_text}",
+        f"**Groups Joined:** {groups_text}",
+    ]
+    embed.add_field(name="Social", value="\n".join(social_lines), inline=True)
+    embed.add_field(name="Primary Group", value=primary_group_text, inline=True)
+    embed.add_field(name="Groups", value=groups_display, inline=False)
+    embed.add_field(name="Avatar", value=avatar_classification, inline=True)
+    embed.add_field(name="Alt Risk Score", value=f"{risk_score}% • {risk_tier}", inline=True)
+    embed.add_field(name="Risk Breakdown", value=breakdown_text, inline=False)
+    embed.set_footer(text=RISK_FOOTER)
+    if avatar_url:
+        embed.set_thumbnail(url=avatar_url)
+
+    await ctx.send(embed=embed)
 
 
 @bot.command()
