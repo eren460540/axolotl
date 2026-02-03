@@ -2754,63 +2754,63 @@ async def gen_op(ctx: commands.Context):
 
 @bot.command(name="roblox")
 async def roblox(ctx: commands.Context, *, username: str):
-    await ctx.trigger_typing()
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        resolved = await resolve_roblox_username(session, username)
-        if not resolved:
-            await ctx.send("❌ User not found.")
-            return
-        user_id = resolved.get("id")
-        if not user_id:
-            await ctx.send("❌ User not found.")
-            return
+    async with ctx.typing():
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            resolved = await resolve_roblox_username(session, username)
+            if not resolved:
+                await ctx.send("❌ User not found.")
+                return
+            user_id = resolved.get("id")
+            if not user_id:
+                await ctx.send("❌ User not found.")
+                return
 
-        user_data, _ = await fetch_json(session, "GET", ROBLOX_USER_URL.format(user_id=user_id))
-        age_data, _ = await fetch_json(session, "GET", ROBLOX_AGE_BRACKET_URL.format(user_id=user_id))
-        friends_data, _ = await fetch_json(session, "GET", ROBLOX_FRIENDS_COUNT_URL.format(user_id=user_id))
-        followers_data, _ = await fetch_json(session, "GET", ROBLOX_FOLLOWERS_COUNT_URL.format(user_id=user_id))
-        following_data, _ = await fetch_json(session, "GET", ROBLOX_FOLLOWING_COUNT_URL.format(user_id=user_id))
-        groups_data, _ = await fetch_json(session, "GET", ROBLOX_GROUPS_URL.format(user_id=user_id))
-        thumb_data, _ = await fetch_json(session, "GET", ROBLOX_AVATAR_THUMB_URL.format(user_id=user_id))
-        wearing_data, _ = await fetch_json(session, "GET", ROBLOX_CURRENTLY_WEARING_URL.format(user_id=user_id))
-        badges_data, _ = await fetch_json(
-            session,
-            "GET",
-            ROBLOX_BADGES_URL.format(user_id=user_id),
-            params={"limit": 10, "sortOrder": "Asc"},
-        )
-        favorites_data, _ = await fetch_json(
-            session,
-            "GET",
-            ROBLOX_FAVORITES_URL,
-            params={
-                "userId": user_id,
-                "assetTypeId": 9,
-                "itemsPerPage": 10,
-                "pageNumber": 1,
-            },
-        )
-        inventory_data, _ = await fetch_json(
-            session,
-            "GET",
-            ROBLOX_INVENTORY_VISIBILITY_URL.format(user_id=user_id),
-        )
-
-        asset_details: list[dict] = []
-        asset_ids = []
-        if wearing_data:
-            asset_ids = wearing_data.get("assetIds", [])
-        if asset_ids:
-            capped_ids = asset_ids[:50]
-            details_data, _ = await fetch_json(
+            user_data, _ = await fetch_json(session, "GET", ROBLOX_USER_URL.format(user_id=user_id))
+            age_data, _ = await fetch_json(session, "GET", ROBLOX_AGE_BRACKET_URL.format(user_id=user_id))
+            friends_data, _ = await fetch_json(session, "GET", ROBLOX_FRIENDS_COUNT_URL.format(user_id=user_id))
+            followers_data, _ = await fetch_json(session, "GET", ROBLOX_FOLLOWERS_COUNT_URL.format(user_id=user_id))
+            following_data, _ = await fetch_json(session, "GET", ROBLOX_FOLLOWING_COUNT_URL.format(user_id=user_id))
+            groups_data, _ = await fetch_json(session, "GET", ROBLOX_GROUPS_URL.format(user_id=user_id))
+            thumb_data, _ = await fetch_json(session, "GET", ROBLOX_AVATAR_THUMB_URL.format(user_id=user_id))
+            wearing_data, _ = await fetch_json(session, "GET", ROBLOX_CURRENTLY_WEARING_URL.format(user_id=user_id))
+            badges_data, _ = await fetch_json(
                 session,
                 "GET",
-                ROBLOX_ASSET_DETAILS_URL,
-                params={"assetIds": ",".join(str(asset_id) for asset_id in capped_ids)},
+                ROBLOX_BADGES_URL.format(user_id=user_id),
+                params={"limit": 10, "sortOrder": "Asc"},
             )
-            if details_data:
-                asset_details = details_data.get("data", [])
+            favorites_data, _ = await fetch_json(
+                session,
+                "GET",
+                ROBLOX_FAVORITES_URL,
+                params={
+                    "userId": user_id,
+                    "assetTypeId": 9,
+                    "itemsPerPage": 10,
+                    "pageNumber": 1,
+                },
+            )
+            inventory_data, _ = await fetch_json(
+                session,
+                "GET",
+                ROBLOX_INVENTORY_VISIBILITY_URL.format(user_id=user_id),
+            )
+
+            asset_details: list[dict] = []
+            asset_ids = []
+            if wearing_data:
+                asset_ids = wearing_data.get("assetIds", [])
+            if asset_ids:
+                capped_ids = asset_ids[:50]
+                details_data, _ = await fetch_json(
+                    session,
+                    "GET",
+                    ROBLOX_ASSET_DETAILS_URL,
+                    params={"assetIds": ",".join(str(asset_id) for asset_id in capped_ids)},
+                )
+                if details_data:
+                    asset_details = details_data.get("data", [])
 
     if not user_data or not isinstance(user_data, dict):
         await ctx.send("⚠️ Unable to fetch public Roblox profile data right now.")
