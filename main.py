@@ -5,6 +5,7 @@ import json
 import random
 import re
 import secrets
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
@@ -236,6 +237,34 @@ INVITE_STOCK_DEFAULTS = {
 invite_cache: Dict[int, int] = {}
 background_tasks: List[asyncio.Task] = []
 consecutive_message_tracker: Dict[int, Tuple[int, int]] = {}
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        if ctx.command and ctx.command.name == "roblox":
+            await ctx.send("Usage: !roblox <username>")
+            return
+        if ctx.command:
+            signature = ctx.command.signature
+            usage = f"Usage: !{ctx.command.qualified_name} {signature}".rstrip()
+            await ctx.send(usage)
+            return
+        await ctx.send("Missing required arguments.")
+        return
+
+    original_error = getattr(error, "original", error)
+    traceback.print_exception(
+        type(original_error),
+        original_error,
+        original_error.__traceback__,
+    )
+    try:
+        await ctx.send("⚠️ Something went wrong while running that command.")
+    except discord.Forbidden:
+        pass
 
 
 db_pool = None
@@ -2723,7 +2752,7 @@ async def gen_op(ctx: commands.Context):
     await handle_gen(ctx, "op", OP_ROLE_ID)
 
 
-@bot.command()
+@bot.command(name="roblox")
 async def roblox(ctx: commands.Context, *, username: str):
     await ctx.trigger_typing()
     timeout = aiohttp.ClientTimeout(total=15)
@@ -2783,11 +2812,11 @@ async def roblox(ctx: commands.Context, *, username: str):
             if details_data:
                 asset_details = details_data.get("data", [])
 
-    if not user_data:
+    if not user_data or not isinstance(user_data, dict):
         await ctx.send("⚠️ Unable to fetch public Roblox profile data right now.")
         return
 
-    resolved_username = user_data.get("name", resolved.get("name", username))
+    resolved_username = user_data.get("name") or resolved.get("name") or username
     display_name = user_data.get("displayName") or resolved_username
     created_raw = user_data.get("created")
     created_dt = None
@@ -2798,7 +2827,7 @@ async def roblox(ctx: commands.Context, *, username: str):
     profile_url = f"https://www.roblox.com/users/{user_id}/profile"
 
     age_bracket = None
-    if age_data:
+    if isinstance(age_data, dict):
         age_bracket = age_data.get("ageBracket")
     if age_bracket == "Over13":
         above_13_text = "True"
@@ -2808,19 +2837,19 @@ async def roblox(ctx: commands.Context, *, username: str):
         above_13_text = "Unavailable"
 
     avatar_url = None
-    if thumb_data:
+    if isinstance(thumb_data, dict):
         thumb_items = thumb_data.get("data", [])
         if thumb_items:
             avatar_url = thumb_items[0].get("imageUrl")
 
-    friends_count = friends_data.get("count") if friends_data else None
-    followers_count = followers_data.get("count") if followers_data else None
-    following_count = following_data.get("count") if following_data else None
+    friends_count = friends_data.get("count") if isinstance(friends_data, dict) else None
+    followers_count = followers_data.get("count") if isinstance(followers_data, dict) else None
+    following_count = following_data.get("count") if isinstance(following_data, dict) else None
 
     group_names: list[str] = []
     primary_group = None
     groups_count = None
-    if groups_data:
+    if isinstance(groups_data, dict):
         groups_list = groups_data.get("data", [])
         groups_count = len(groups_list)
         for entry in groups_list:
@@ -2833,14 +2862,14 @@ async def roblox(ctx: commands.Context, *, username: str):
 
     avatar_classification = classify_avatar_assets(asset_details, len(asset_ids))
 
-    badges_available = badges_data is not None
-    badges_list = badges_data.get("data", []) if badges_data else []
+    badges_available = isinstance(badges_data, dict)
+    badges_list = badges_data.get("data", []) if isinstance(badges_data, dict) else []
     has_badges = bool(badges_list)
 
-    favorites_available = favorites_data is not None
+    favorites_available = isinstance(favorites_data, dict)
     favorites_list = []
     total_favorites = None
-    if favorites_data:
+    if isinstance(favorites_data, dict):
         if "Data" in favorites_data:
             favorites_list = favorites_data.get("Data", [])
             total_favorites = favorites_data.get("TotalItems")
@@ -2851,7 +2880,7 @@ async def roblox(ctx: commands.Context, *, username: str):
     has_favorites = bool(total_favorites)
 
     inventory_visibility = None
-    if inventory_data:
+    if isinstance(inventory_data, dict):
         inventory_visibility = inventory_data.get("canView")
 
     risk_score = 0
