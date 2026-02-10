@@ -123,7 +123,17 @@ RANKS = [
 ]
 
 RNG_COOLDOWN = 0
-GENERATOR_COOLDOWN_SECONDS = 15
+GENERATOR_COOLDOWN_SECONDS_BY_TIER = {
+    "free": 15,
+    "premium": 30 * 60,
+    "op": 60 * 60,
+}
+
+GENERATOR_TIER_LABELS = {
+    "free": "Free",
+    "premium": "Premium",
+    "op": "OP",
+}
 
 timezone_berlin = ZoneInfo("Europe/Berlin")
 
@@ -311,6 +321,24 @@ def parse_duration(value: str) -> int:
     if seconds <= 0:
         raise ValueError("Time amount must be at least 1 second.")
     return seconds
+
+
+def format_remaining_time(seconds: int) -> str:
+    total_seconds = max(1, int(seconds))
+    if total_seconds >= 3600:
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        hour_label = "hour" if hours == 1 else "hours"
+        if minutes > 0:
+            minute_label = "minute" if minutes == 1 else "minutes"
+            return f"{hours} {hour_label} {minutes} {minute_label}"
+        return f"{hours} {hour_label}"
+    if total_seconds >= 60:
+        minutes = (total_seconds + 59) // 60
+        minute_label = "minute" if minutes == 1 else "minutes"
+        return f"{minutes} {minute_label}"
+    second_label = "second" if total_seconds == 1 else "seconds"
+    return f"{total_seconds} {second_label}"
 
 
 COLOR_MAP = {
@@ -671,14 +699,105 @@ async def run_migrations():
             );
             """
         )
-        await conn.execute(
+        cooldowns_table_exists = await conn.fetchval(
             """
-            CREATE TABLE IF NOT EXISTS generator_cooldowns (
-                user_id BIGINT PRIMARY KEY,
-                last_gen BIGINT NOT NULL
-            );
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema='public' AND table_name='generator_cooldowns'
+            )
             """
         )
+        if not cooldowns_table_exists:
+            await conn.execute(
+                """
+                CREATE TABLE generator_cooldowns (
+                    user_id BIGINT NOT NULL,
+                    tier TEXT NOT NULL CHECK (tier IN ('free', 'premium', 'op')),
+                    last_gen BIGINT NOT NULL,
+                    PRIMARY KEY (user_id, tier)
+                );
+                """
+            )
+        else:
+            tier_exists = await conn.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema='public'
+                      AND table_name='generator_cooldowns'
+                      AND column_name='tier'
+                )
+                """
+            )
+            if not tier_exists:
+                await conn.execute("ALTER TABLE generator_cooldowns ADD COLUMN tier TEXT")
+                await conn.execute("UPDATE generator_cooldowns SET tier='free' WHERE tier IS NULL")
+                await conn.execute("ALTER TABLE generator_cooldowns ALTER COLUMN tier SET NOT NULL")
+
+            tier_is_nullable = await conn.fetchval(
+                """
+                SELECT is_nullable='YES'
+                FROM information_schema.columns
+                WHERE table_schema='public'
+                  AND table_name='generator_cooldowns'
+                  AND column_name='tier'
+                """
+            )
+            if tier_is_nullable:
+                await conn.execute("UPDATE generator_cooldowns SET tier='free' WHERE tier IS NULL")
+                await conn.execute("ALTER TABLE generator_cooldowns ALTER COLUMN tier SET NOT NULL")
+
+            tier_check_exists = await conn.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint c
+                    JOIN pg_class t ON t.oid = c.conrelid
+                    WHERE t.relname='generator_cooldowns'
+                      AND c.conname='generator_cooldowns_tier_check'
+                )
+                """
+            )
+            if not tier_check_exists:
+                await conn.execute(
+                    """
+                    ALTER TABLE generator_cooldowns
+                    ADD CONSTRAINT generator_cooldowns_tier_check
+                    CHECK (tier IN ('free', 'premium', 'op'))
+                    """
+                )
+
+            pk_columns = await conn.fetch(
+                """
+                SELECT a.attname AS column_name
+                FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey)
+                WHERE t.relname='generator_cooldowns' AND c.contype='p'
+                ORDER BY array_position(c.conkey, a.attnum)
+                """
+            )
+            pk_column_names = [row["column_name"] for row in pk_columns]
+            if pk_column_names != ["user_id", "tier"]:
+                pk_name = await conn.fetchval(
+                    """
+                    SELECT c.conname
+                    FROM pg_constraint c
+                    JOIN pg_class t ON t.oid = c.conrelid
+                    WHERE t.relname='generator_cooldowns' AND c.contype='p'
+                    """
+                )
+                if pk_name:
+                    safe_pk_name = str(pk_name).replace(chr(34), chr(34) * 2)
+                    await conn.execute(f"ALTER TABLE generator_cooldowns DROP CONSTRAINT \"{safe_pk_name}\"")
+                await conn.execute(
+                    """
+                    ALTER TABLE generator_cooldowns
+                    ADD CONSTRAINT generator_cooldowns_pkey PRIMARY KEY (user_id, tier)
+                    """
+                )
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS generator_stats (
@@ -2637,15 +2756,18 @@ async def handle_gen(ctx: commands.Context, tier: str, required_role_id: int):
         await ctx.send("❌ Access missing.")
         return
     now = now_ts()
+    cooldown_seconds = GENERATOR_COOLDOWN_SECONDS_BY_TIER[tier]
+    tier_name = GENERATOR_TIER_LABELS[tier]
     cooldown_row = await db_pool.fetchrow(
-        "SELECT last_gen FROM generator_cooldowns WHERE user_id=$1",
+        "SELECT last_gen FROM generator_cooldowns WHERE user_id=$1 AND tier=$2",
         ctx.author.id,
+        tier,
     )
     if cooldown_row:
         last_gen = int(cooldown_row["last_gen"])
-        remaining = GENERATOR_COOLDOWN_SECONDS - (now - last_gen)
+        remaining = cooldown_seconds - (now - last_gen)
         if remaining > 0:
-            await ctx.send(f"⏳ Please wait {remaining}s before generating again.")
+            await ctx.send(f"⏳ Please wait {format_remaining_time(remaining)} before generating again.")
             return
 
     async with db_pool.acquire() as conn:
@@ -2655,30 +2777,38 @@ async def handle_gen(ctx: commands.Context, tier: str, required_role_id: int):
                 SELECT id, username, password
                 FROM generator_stock
                 WHERE tier=$1 AND claimed=FALSE
-                ORDER BY random()
+                ORDER BY id ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
                 """,
                 tier,
             )
-            actual_tier = tier
-            if not row and tier == "premium":
-                row = await conn.fetchrow(
-                    """
-                    SELECT id, username, password
-                    FROM generator_stock
-                    WHERE tier=$1 AND claimed=FALSE
-                    ORDER BY random()
-                    LIMIT 1
-                    FOR UPDATE SKIP LOCKED
-                    """,
-                    "free",
-                )
-                if row:
-                    actual_tier = "free"
             if not row:
-                await ctx.send("⚠️ No accounts are available right now. Please try again later.")
+                await ctx.send(f"📦 ❌ Out of Stock — {tier_name} Generator")
                 return
+
+            username = row["username"]
+            password = row["password"]
+            color = GENERATOR_TIER_COLORS.get(tier, discord.Color.blurple())
+            dm_embed = discord.Embed(
+                title="🔐 Your Generated Account",
+                description="Here are your account details. Keep them safe and private.",
+                color=color,
+            )
+            dm_embed.add_field(name="👤 Username", value=f"```{username}```", inline=False)
+            dm_embed.add_field(name="🔑 Password", value=f"```{password}```", inline=False)
+            dm_embed.add_field(name="🧩 Combo", value=f"```{username}:{password}```", inline=False)
+            dm_embed.add_field(name="⭐ Tier", value=tier_name, inline=True)
+            dm_embed.add_field(name="🛡️ Safety Tip", value="Never share your credentials with anyone.", inline=True)
+            dm_embed.set_footer(text=f"Axolotl Generator • Tier: {tier_name}")
+            try:
+                await ctx.author.send(embed=dm_embed)
+            except discord.Forbidden:
+                await ctx.send(
+                    "⚠️ I couldn't DM you. Please enable DMs and try again."
+                )
+                return
+
             await conn.execute(
                 """
                 UPDATE generator_stock
@@ -2691,32 +2821,20 @@ async def handle_gen(ctx: commands.Context, tier: str, required_role_id: int):
             )
             await conn.execute(
                 """
-                INSERT INTO generator_cooldowns (user_id, last_gen)
-                VALUES ($1, $2)
-                ON CONFLICT (user_id) DO UPDATE SET last_gen=EXCLUDED.last_gen
+                INSERT INTO generator_cooldowns (user_id, tier, last_gen)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_id, tier) DO UPDATE SET last_gen=EXCLUDED.last_gen
                 """,
                 ctx.author.id,
+                tier,
                 now,
             )
             await conn.execute(
                 "UPDATE generator_stats SET global_generations=global_generations+1 WHERE tier=$1",
-                actual_tier,
+                tier,
             )
 
-    username = row["username"]
-    password = row["password"]
-    color = GENERATOR_TIER_COLORS.get(actual_tier, discord.Color.blurple())
-    dm_embed = discord.Embed(
-        title="🔐 Your Generated Account",
-        description="Here are your account details. Keep them safe and private.",
-        color=color,
-    )
-    dm_embed.add_field(name="👤 Username", value=f"```{username}```", inline=False)
-    dm_embed.add_field(name="🔑 Password", value=f"```{password}```", inline=False)
-    dm_embed.add_field(name="🧩 Combo", value=f"```{username}:{password}```", inline=False)
-    dm_embed.add_field(name="⭐ Tier", value=actual_tier.capitalize(), inline=True)
-    dm_embed.add_field(name="🛡️ Safety Tip", value="Never share your credentials with anyone.", inline=True)
-    dm_embed.set_footer(text=f"Axolotl Generator • Tier: {actual_tier.capitalize()}")
+    color = GENERATOR_TIER_COLORS.get(tier, discord.Color.blurple())
     public_embed = discord.Embed(
         title=f"📬 Account Sent! {EMOJI['sparkle_eyes']} {EMOJI['meru_clap']}",
         description=(
@@ -2727,14 +2845,21 @@ async def handle_gen(ctx: commands.Context, tier: str, required_role_id: int):
         color=color,
     )
     public_embed.set_footer(text="If you didn't receive a DM, make sure your DMs are open.")
-    try:
-        await ctx.author.send(embed=dm_embed)
-        await ctx.send(embed=public_embed)
-    except discord.Forbidden:
-        await ctx.send(
-            "⚠️ I couldn't DM you. Please enable DMs and try again."
-        )
-        return
+    await ctx.send(embed=public_embed)
+
+
+async def handle_stock_check(ctx: commands.Context, tier: str):
+    tier_name = GENERATOR_TIER_LABELS[tier]
+    remaining = await db_pool.fetchval(
+        "SELECT COUNT(*) FROM generator_stock WHERE tier=$1 AND claimed=FALSE",
+        tier,
+    )
+    embed = discord.Embed(
+        title=f"📦 {tier_name} Generator Stock",
+        color=GENERATOR_TIER_COLORS.get(tier, discord.Color.blurple()),
+    )
+    embed.add_field(name="Remaining", value=str(int(remaining or 0)), inline=False)
+    await ctx.send(embed=embed)
 
 
 @bot.command()
@@ -2750,6 +2875,21 @@ async def gen_premium(ctx: commands.Context):
 @bot.command()
 async def gen_op(ctx: commands.Context):
     await handle_gen(ctx, "op", OP_ROLE_ID)
+
+
+@bot.command()
+async def stock_free(ctx: commands.Context):
+    await handle_stock_check(ctx, "free")
+
+
+@bot.command()
+async def stock_premium(ctx: commands.Context):
+    await handle_stock_check(ctx, "premium")
+
+
+@bot.command()
+async def stock_op(ctx: commands.Context):
+    await handle_stock_check(ctx, "op")
 
 
 @bot.command(name="roblox")
